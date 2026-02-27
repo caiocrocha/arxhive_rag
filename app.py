@@ -9,12 +9,11 @@ from nltk.stem import WordNetLemmatizer
 from datasets import load_dataset
 from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
+from langchain_community.vectorstores import Chroma
 from langchain.embeddings import SentenceTransformerEmbeddings
 from langchain.chains import RetrievalQA
 from langchain_openai import ChatOpenAI
 from langchain_core.documents import Document
-from langchain.vectorstores import Chroma
 from sentence_transformers import SentenceTransformer
 from langchain.embeddings.base import Embeddings
 from typing import List
