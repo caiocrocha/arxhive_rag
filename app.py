@@ -84,11 +84,13 @@ def load_and_prepare_docs():
 
 @st.cache_resource
 def load_vector_db(_chunks):
+    # load embedding model
     embedding = SentenceTransformerEmbeddings(
         model_name="all-MiniLM-L6-v2",
         device="cuda" if torch.cuda.is_available() else "cpu",
         batch_size=128
     )
+    # create or load vector database
     if _chunks is None or len(_chunks) == 0:
         vectordb = Chroma(
             persist_directory=PERSIST_DIR,
@@ -108,6 +110,7 @@ def load_vector_db(_chunks):
 @st.cache_resource
 def load_qa_chain(_vectordb, api_key):
     retriever = _vectordb.as_retriever()
+    # load LLM for question answering
     llm = ChatOpenAI(
         model="deepseek/deepseek-r1:free",
         openai_api_key=api_key,
