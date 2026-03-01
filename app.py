@@ -1,153 +1,161 @@
 import streamlit as st
 import os
-import sys
 import re
-import nltk
+import json
 import torch
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
+import faiss
+import numpy as np
 from datasets import load_dataset
-from langchain_core.documents import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain.embeddings import SentenceTransformerEmbeddings
-from langchain.chains import RetrievalQA
-from langchain_openai import ChatOpenAI
-from langchain_core.documents import Document
 from sentence_transformers import SentenceTransformer
-from langchain.embeddings.base import Embeddings
-from typing import List
+from langchain_openai import ChatOpenAI
 
-PERSIST_DIR = "db_v1"
+# ---- HARD MEMORY CONTROLS ----
+torch.set_num_threads(1)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Custom embedding class with GPU support and batch processing
-class SentenceTransformerEmbeddings(Embeddings):
-    def __init__(self, model_name: str, device: torch.device = "cuda", batch_size: int = 32):
-        self.model = SentenceTransformer(model_name, device=device)
-        self.batch_size = batch_size
+INDEX_FILE = "faiss.index"
+META_FILE = "metadata.jsonl"
 
-    def embed_documents(self, documents: List[str]) -> List[List[float]]:
-        # Process in batches for large datasets
-        return [
-            emb.tolist()
-            for i in range(0, len(documents), self.batch_size)
-            for emb in self.model.encode(
-                documents[i:i+self.batch_size], convert_to_tensor=False, show_progress_bar=False
-            )
-        ]
-
-    def embed_query(self, query: str) -> List[float]:
-        return self.model.encode([query])[0].tolist()
-
-# Setup
-st.set_page_config(page_title="Semantic Search App", layout="centered")
+st.set_page_config(page_title="ArXHive Semantic Search")
 st.title("🐝 ArXHive Semantic Search 📚")
 
-# Download NLTK data
-nltk.download("stopwords")
-nltk.download("wordnet")
-
-# Preprocessing setup
-stop_words = set(stopwords.words("english"))
-lemmatizer = WordNetLemmatizer()
-
-def preprocess_text(text):
+# -----------------------------
+# Preprocess
+# -----------------------------
+def preprocess(text: str) -> str:
     text = text.lower()
-    text = re.sub(r'\d+', '', text)
-    text = re.sub(r'\W+', ' ', text)
-    words = text.split()
-    words = [lemmatizer.lemmatize(word) for word in words if word not in stop_words]
-    return ' '.join(words)
+    text = re.sub(r"\W+", " ", text)
+    return text.strip()
 
+# -----------------------------
+# Load embedding model (cached)
+# -----------------------------
 @st.cache_resource
-def load_and_prepare_docs():
-    dataset = load_dataset("neuralwork/arxiver")
-    df = dataset["train"].to_pandas()
-    abstracts = dataset["train"]["abstract"]
-    processed_abstracts = [preprocess_text(abs_) for abs_ in abstracts]
-    df["processed_abstract"] = processed_abstracts
+def load_model():
+    return SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
-    documents = df.apply(lambda row: Document(
-        page_content=row["processed_abstract"],
-        metadata={
-            "id": row["id"],
+# -----------------------------
+# Build or Load FAISS
+# -----------------------------
+@st.cache_resource(show_spinner=True)
+def build_or_load_index(_model):
+
+    if os.path.exists(INDEX_FILE) and os.path.exists(META_FILE):
+        index = faiss.read_index(INDEX_FILE)
+        return index
+
+    st.info("Building FAISS index (first run only)...")
+
+    dataset = load_dataset("neuralwork/arxiver", split="train", streaming=True)
+
+    dim = 384  # all-MiniLM-L6-v2 dimension
+    index = faiss.IndexFlatIP(dim)
+
+    metadata_file = open(META_FILE, "w")
+
+    batch_texts = []
+    batch_meta = []
+    batch_size = 512
+
+    for row in dataset:
+        text = preprocess(row["abstract"])
+
+        batch_texts.append(text)
+        batch_meta.append({
             "title": row["title"],
             "authors": row["authors"],
             "published_date": row["published_date"],
             "link": row["link"],
             "abstract": row["abstract"],
-        }), axis=1).tolist()
+        })
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=20)
-    chunks = text_splitter.split_documents(documents)
-    return chunks
+        if len(batch_texts) >= batch_size:
+            embeddings = _model.encode(batch_texts, convert_to_numpy=True, normalize_embeddings=True)
+            index.add(embeddings)
 
+            for m in batch_meta:
+                metadata_file.write(json.dumps(m) + "\n")
+
+            batch_texts = []
+            batch_meta = []
+
+    if batch_texts:
+        embeddings = _model.encode(batch_texts, convert_to_numpy=True, normalize_embeddings=True)
+        index.add(embeddings)
+        for m in batch_meta:
+            metadata_file.write(json.dumps(m) + "\n")
+
+    metadata_file.close()
+    faiss.write_index(index, INDEX_FILE)
+
+    return index
+
+# -----------------------------
+# Search
+# -----------------------------
+def search(query, model, index, k=5):
+    query_vec = model.encode([query], normalize_embeddings=True)
+    scores, indices = index.search(query_vec, k)
+
+    results = []
+    with open(META_FILE, "r") as f:
+        all_meta = f.readlines()
+
+    for idx in indices[0]:
+        if idx < len(all_meta):
+            results.append(json.loads(all_meta[idx]))
+
+    return results
+
+# -----------------------------
+# LLM
+# -----------------------------
 @st.cache_resource
-def load_vector_db(_chunks):
-    # load embedding model
-    embedding = SentenceTransformerEmbeddings(
-        model_name="all-MiniLM-L6-v2",
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        batch_size=128
-    )
-    # create or load vector database
-    if _chunks is None or len(_chunks) == 0:
-        vectordb = Chroma(
-            persist_directory=PERSIST_DIR,
-            embedding_function=embedding,
-            collection_metadata={"hnsw:space": "cosine"}
-        )
-    else:
-        vectordb = Chroma.from_documents(
-            documents=_chunks,
-            embedding=embedding,
-            persist_directory=PERSIST_DIR,
-            collection_metadata={"hnsw:space": "cosine"}
-        )
-        vectordb.persist()
-    return vectordb
-
-@st.cache_resource
-def load_qa_chain(_vectordb, api_key):
-    retriever = _vectordb.as_retriever()
-    # load LLM for question answering
-    llm = ChatOpenAI(
-        model="deepseek/deepseek-r1:free",
+def load_llm(api_key):
+    return ChatOpenAI(
+        model="deepseek/deepseek-r1",
         openai_api_key=api_key,
-        openai_api_base="https://openrouter.ai/api/v1"
+        openai_api_base="https://openrouter.ai/api/v1",
+        temperature=0
     )
-    return RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type="stuff")
 
-# Get API key
+# -----------------------------
+# API KEY
+# -----------------------------
 api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+
 if not api_key:
-    api_key = st.text_input("🔑 Enter your OpenRouter API key", type="password")
-    if api_key:
-        os.environ["OPENAI_API_KEY"] = api_key
+    api_key = st.text_input("🔑 Enter OpenRouter API key", type="password")
 
 if api_key:
-    chunks = None
-    if not os.path.exists(PERSIST_DIR) or not os.path.isdir(PERSIST_DIR) or not os.listdir(PERSIST_DIR):
-        with st.spinner("Loading and preprocessing ArXiv dataset... this may take a few minutes..."):
-            chunks = load_and_prepare_docs()
-    with st.spinner("Loading embedding model and vector database... hang on for a few more minutes..."):
-        vectordb = load_vector_db(chunks)
-    with st.spinner("Loading LLM and Retrieval QA chain... almost there..."):
-        qa_chain = load_qa_chain(vectordb, api_key)
 
-    query = st.text_input("Ask a research question:", placeholder="e.g., What is the dominant approach for image segmentation?")
+    model = load_model()
+    index = build_or_load_index(model)
+    llm = load_llm(api_key)
+
+    query = st.text_input("Ask a research question:")
+
     if query:
-        with st.spinner("Generating answer..."):
-            answer = qa_chain.invoke(query)
-            st.markdown("### ✅ Answer")
-            st.markdown(answer.get("result", "No answer found."))
+        with st.spinner("Searching..."):
+            results = search(query, model, index)
 
-            st.markdown("---\n### 📄 Top Matching Abstracts")
-            matches = vectordb.similarity_search(query, k=5)
-            for doc in matches:
-                st.markdown(f"**Title:** {doc.metadata.get('title', 'N/A')}")
-                st.markdown(f"**Authors:** {doc.metadata.get('authors', 'N/A')}")
-                st.markdown(f"**Published date:** {doc.metadata.get('published_date', 'N/A')}")
-                st.markdown(f"**Link:** {doc.metadata.get('link', 'N/A')}")
-                st.markdown(f"> {doc.metadata.get('abstract', doc.page_content)[:500]}...")
+            context = "\n\n".join(r["abstract"] for r in results)
+
+            prompt = f"""
+            Use the following research abstracts to answer the question.
+
+            {context}
+
+            Question: {query}
+            """
+
+            response = llm.invoke(prompt)
+
+            st.markdown("### ✅ Answer")
+            st.write(response.content)
+
+            st.markdown("### 📄 Top Matches")
+            for r in results:
+                st.markdown(f"**{r['title']}**")
+                st.write(r["abstract"][:400] + "...")
                 st.markdown("---")
